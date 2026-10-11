@@ -11,7 +11,10 @@ import argparse, json, math, os, sys
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+for _p in (os.path.dirname(os.path.abspath(__file__)),
+           os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from lookup import STAT_SHEETS, stat_xy, parse_kml, safe, DEFAULT_ATLAS
 from parse_atlas import DEFAULT_CACHE
 

@@ -11,7 +11,10 @@ from collections import deque
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+for _p in (os.path.dirname(os.path.abspath(__file__)),
+           os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from parse_atlas import runs_per_row, group_runs, DEFAULT_ATLAS, DEFAULT_CACHE
 
 KM = 111.0 / 1162.0

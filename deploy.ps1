@@ -23,7 +23,7 @@ if (Sync-One "$dev\SKILL.md" $dest) { $n++ }
 Get-ChildItem "$dev\scripts" -Filter *.py -File | ForEach-Object {
     if (Sync-One $_.FullName "$dest\scripts\$($_.Name)") { $n++ }
 }
-# 缓存目录（预解析产物 + 人工确认线值库）：必须同步，否则部署副本查到旧值
+# 缓存目录（预解析产物 + 人工确认线值库 + 几何缓存）：必须同步，否则部署副本查到旧值
 foreach ($sub in @('cache')) {
     if (Test-Path "$dev\$sub") {
         New-Item -ItemType Directory -Force -Path "$dest\$sub" | Out-Null
@@ -33,6 +33,13 @@ foreach ($sub in @('cache')) {
             New-Item -ItemType Directory -Force -Path (Split-Path $tgt) | Out-Null
             if (Sync-One $_.FullName $tgt) { $n++ }
         }
+    }
+}
+# 清理部署目录中已从源码 scripts/ 移除的旧脚本（一次性数字化工具已移 tools/，不部署）
+Get-ChildItem "$dest\scripts" -Filter *.py -File -ErrorAction SilentlyContinue | ForEach-Object {
+    if (-not (Test-Path "$dev\scripts\$($_.Name)")) {
+        Remove-Item $_.FullName -Force
+        Write-Output "清理部署残留: scripts\$($_.Name)"
     }
 }
 # 图集（分辨率不可变，配准依赖绝对像素）

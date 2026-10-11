@@ -1,55 +1,31 @@
 # -*- coding: utf-8 -*-
 """
 江西省暴雨洪水查算手册图集 —— 按经纬度/KML 查暴雨参数/分区参数
-用法（两步工作流，详见 SKILL.md）:
-  第1步 生成裁剪图:
+用法（详见 SKILL.md）:
+  裁剪图（读图复核用）:
     python lookup.py --lon 115.88 --lat 28.68 --name 南昌 --out-dir D:\\out
     python lookup.py --kml C:\\points.kml --out-dir D:\\out        # 支持多点位
-  第2步 读值后生成正式报告:
-    python lookup.py --kml ... --out-dir ... --values-file values.json
+  正式报告（两种取值来源）:
+    python lookup.py --kml ... --out-dir ... --from-auto values.json   # auto_value 输出自动填值（推荐草稿）
+    python lookup.py --kml ... --out-dir ... --values-file values.json # 人工定稿 values.json
 values.json:
   单点位: {"1h": {"Pa":..,"Pa_s":..,"Pa_q":..,"Cv":..,"Cv_s":..,"Cv_q":..}, ..., "zones": {...}, "summary": ".."}
   多点位: {"points": {"点名": {同上}}, "summary": ".."}   （缺省点位键时按第一个点处理）
 """
-import argparse, base64, json, os, re, sys
+import argparse, base64, hashlib, json, os, re, sys
 import html as _html
 import xml.etree.ElementTree as ET
 from PIL import Image, ImageDraw
 
-_ATLAS_CANDIDATES = [
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'atlas'),
-    r"D:\DSH工作区\自动查找图集参数\江西省暴雨洪水查算手册图集",
-]
-DEFAULT_ATLAS = next((p for p in _ATLAS_CANDIDATES if os.path.isdir(p)), _ATLAS_CANDIDATES[-1])
+# 配准常数/坐标换算的单一来源在 registry.py（勿在本文件另立常数）
+from registry import (resolve_atlas, stat_xy, part_xy, out_of_bounds,
+                      STAT_SHEETS, PART_SHEETS, STAT_KEYS, STAT_FILE,
+                      S_STAT, S9, STAT_BASE, SKILL_ROOT)
 
-# ---------------- 配准常数（实测标定，勿随意改动） ----------------
-S_STAT = 1162.0
-STAT_SHEETS = [
-    ("1--1h-Pa.jpg",  "1h 暴雨均值 Pa"), ("2--1h-Cv.jpg",  "1h Cv"),
-    ("3--6h-Pa.jpg",  "6h 暴雨均值 Pa"), ("4--6h-Cv.jpg",  "6h Cv"),
-    ("5--24h-Pa.jpg", "24h 暴雨均值 Pa"),("6--24h-Cv.jpg", "24h Cv"),
-    ("7--3d-Pa.jpg",  "3d 暴雨均值 Pa"), ("8--3d-Cv.jpg",  "3d Cv"),
-]
-STAT_BASE = {"W": 5495, "H": 7076, "X0": 433.0, "Y0": 345.0}
-S9 = 1170.0
-# 分区图（附图3-1/3-2/4-2）版面与统计图不同，逐幅单独标定：
-# x = CX + (lon-115.88)*S9 ; y = CY + (28.68-lat)*S9   （锚点=南昌 115.88E,28.68N）
-# 【重要规律】三张分区图（产流/瞬时单位线/推理公式）的分区号完全一致 —— 只需读产流分区图，
-# 另两张不必生成/判读；仅在需要人工复核时用 --all-zones 全部生成。
-PART_SHEETS = [
-    ("9--产流分区.jpg", "产流计算分区",     3160, 3390, True),
-    ("9--瞬时分区.jpg", "瞬时单位线分区",   3160, 3390, False),
-    ("9--推理分区.jpg", "推理公式计算分区", 3135, 2770, False),  # 该页图框位置与前两页不同!
-]
+# 兼容旧引用（query_atlas / trace_line / annotate_lines 等从 lookup 导入这些名字）
+DEFAULT_ATLAS = resolve_atlas()
+DEFAULT_CACHE = os.path.join(SKILL_ROOT, 'cache')
 DURATIONS = ["1h", "6h", "24h", "3d"]
-
-def stat_xy(lon, lat, w, h):
-    x0 = STAT_BASE["X0"] * w / STAT_BASE["W"]
-    y0 = STAT_BASE["Y0"] * h / STAT_BASE["H"]
-    return x0 + (lon - 114) * S_STAT, y0 + (30 - lat) * S_STAT
-
-def part_xy(lon, lat, cx, cy):
-    return cx + (lon - 115.88) * S9, cy + (28.68 - lat) * S9
 
 def rich(s):
     """把文本里的警示内容渲染为红色粗体。
@@ -90,41 +66,152 @@ def img_b64(path):
         return base64.b64encode(f.read()).decode()
 
 def parse_kml(path):
-    """返回 [(name, lon, lat), ...]；兼容 kml/2.2 命名空间，只取 Point 型 Placemark"""
+    """返回 [(name, lon, lat, src), ...]，src ∈ {"point", "polygon-centroid"}。
+
+    兼容 kml/2.2 命名空间。每个 Placemark 取第一个 Point 坐标；无 Point 时
+    取第一个 Polygon（外环第一个 coordinates，即外边界）的几何中心——
+    水库/工程 KML 常为面要素，质心仅代表面中心，报告会注明。
+    """
     tree = ET.parse(path)
     root = tree.getroot()
     uri = root.tag.split("}")[0].strip("{") if root.tag.startswith("{") else ""
     def q(tag):
         return "{%s}%s" % (uri, tag) if uri else tag
+
+    def coords_of(el):
+        txt = (el.text or "").strip()
+        out = []
+        for line in re.split(r"\s+", txt):
+            parts = line.split(",")
+            if len(parts) >= 2:
+                try:
+                    out.append((float(parts[0]), float(parts[1])))
+                except ValueError:
+                    pass
+        return out
+
     pts = []
     for pm in root.iter(q("Placemark")):
-        name = pm.findtext(q("name")) or "未命名"
-        for co in pm.iter(q("coordinates")):
-            txt = (co.text or "").strip()
-            for line in re.split(r"\s+", txt):
-                if not line:
-                    continue
-                parts = line.split(",")
-                if len(parts) >= 2:
-                    try:
-                        lon, lat = float(parts[0]), float(parts[1])
-                    except ValueError:
-                        continue
-                    if 113.0 < lon < 119.0 and 24.0 < lat < 31.0:
-                        pts.append((name.strip(), lon, lat))
-            if pts and pts[-1][0] == name.strip():
-                break   # 只取该 Placemark 的第一个坐标（Point 型）
+        name = (pm.findtext(q("name")) or "未命名").strip()
+        p = pm.find(q("Point"))
+        co = p.find(q("coordinates")) if p is not None else None
+        if co is not None and coords_of(co):
+            lon, lat = coords_of(co)[0]
+            if 113.0 < lon < 119.0 and 24.0 < lat < 31.0:
+                pts.append((name, lon, lat, "point"))
+            continue
+        # 面要素：取第一个 Polygon 的外环坐标求几何中心（文档顺序中外环在前）
+        poly = next((el for el in pm.iter() if el.tag == q("Polygon")), None)
+        if poly is not None:
+            ring = next((c for c in poly.iter(q("coordinates"))), None)
+            cs = coords_of(ring) if ring is not None else []
+            if cs:
+                lon = sum(c[0] for c in cs) / len(cs)
+                lat = sum(c[1] for c in cs) / len(cs)
+                if 113.0 < lon < 119.0 and 24.0 < lat < 31.0:
+                    pts.append((name, lon, lat, "polygon-centroid"))
     # 去重（同名同坐标）
     seen, out = set(), []
-    for n, lo, la in pts:
+    for n, lo, la, src in pts:
         key = (n, round(lo, 6), round(la, 6))
         if key not in seen:
             seen.add(key)
-            out.append((n, lo, la))
+            out.append((n, lo, la, src))
     return out
 
 def safe(s):
     return re.sub(r'[\\/:*?"<>|\s]+', "_", s) or "pt"
+
+
+def _file_md5(p):
+    h = hashlib.md5()
+    with open(p, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    return h.hexdigest()
+
+
+def data_stamp():
+    """线值库/几何缓存指纹（报告可追溯用：回答"当时用的哪版数据"）。"""
+    import time as _t
+    try:
+        h, n = hashlib.md5(), 0
+        for k in STAT_KEYS:
+            p = os.path.join(DEFAULT_CACHE, 'manual_labels_v2', k + '_lines.json')
+            h.update(_file_md5(p).encode())
+            n += len(json.load(open(p, encoding='utf-8')))
+        g = hashlib.md5()
+        for k in STAT_KEYS:
+            gp = os.path.join(DEFAULT_CACHE, 'geometry', k + '.npz')
+            if os.path.isfile(gp):
+                g.update(_file_md5(gp).encode())
+        return '生成 %s · 线值库 v2（%d 条人工确认，指纹 %s）· 几何缓存 %s' % (
+            _t.strftime('%Y-%m-%d %H:%M'), n, h.hexdigest()[:8], g.hexdigest()[:8])
+    except Exception:
+        return '生成 %s · 数据指纹不可用' % _t.strftime('%Y-%m-%d %H:%M')
+
+
+def values_from_auto(auto):
+    """auto_value 输出 JSON → 报告 values.json 结构（草稿自动填值）。
+
+    填值规则（与人工口径一致，见 SKILL.md）：
+      Pa = 距离加权内插值（mm 取整）；Cv = 内插值（2 位小数）；
+      建议采用值(_s) = 内插值向大值方向抬 1/4 等值线间隔，不越过夹持区间的大值线
+        （"抬 1/5~1/4 档、不越半档"，内插位置越靠近大值线，上抬余量越小）；
+      取值依据(_q) = 线号/线值/距离/方位自动成文，warning 原文附后（模板按关键词标红）。
+    """
+    def one(av):
+        val, warns = {'zones': {}}, []
+        for du in DURATIONS:
+            d = {}
+            for metric in ('Pa', 'Cv'):
+                ent = (av.get('values') or {}).get('%s-%s' % (du, metric))
+                if not ent:
+                    continue
+                near = ent['nearest']
+                v = ent.get('interpolated', near['value'])
+                opp = ent.get('opposite')
+                if opp:
+                    hi = max(near['value'], opp['value'])
+                    step = abs(opp['value'] - near['value'])
+                    sug = min(v + 0.25 * step, hi)
+                    q = ('距 %g 线 %.1f km（方位 %s°），对侧 %g 线 %.1f km（方位 %s°），'
+                         '距离加权内插；线号 %s/%s'
+                         % (near['value'], near['km'], near['azimuth'],
+                            opp['value'], opp['km'], opp['azimuth'], near['id'], opp['id']))
+                else:
+                    sug = v
+                    q = ('最近 %g 线 %.1f km（方位 %s°），无对侧线，暂取最近线值；线号 %s'
+                         % (near['value'], near['km'], near['azimuth'], near['id']))
+                if ent.get('warning'):
+                    q += '；' + ent['warning']
+                    warns.append('%s-%s：%s' % (du, metric, ent['warning']))
+                if metric == 'Pa':
+                    v, sug = int(round(v)), int(round(sug))
+                else:
+                    v, sug = round(v, 2), round(sug, 2)
+                d[metric], d[metric + '_s'], d[metric + '_q'] = v, sug, q
+            if d:
+                val[du] = d
+        zone = av.get('zone')
+        val['zones']['产流'] = zone or ''
+        if av.get('zone_warning'):
+            warns.append('产流分区：' + av['zone_warning'])
+        seg = '、'.join('%s Pa %s→%s mm、Cv %s→%s'
+                        % (du, val[du]['Pa'], val[du]['Pa_s'], val[du]['Cv'], val[du]['Cv_s'])
+                        for du in DURATIONS if du in val)
+        summary = ('（机器初值草稿，复核 warning 项后定稿）本工程点位于产流分区第 %s 区'
+                   '（三张分区图同号）；%s。箭头后为建议采用值（偏安全：内插值向大值方向'
+                   '抬约 1/4 等值线间隔，不越夹持区间大值线）。' % (zone or '?', seg))
+        if warns:
+            summary += '**以下 %d 项须人工对图复核：%s**' % (len(warns), '；'.join(warns))
+        val['summary'] = summary
+        return val
+
+    if isinstance(auto.get('points'), dict):
+        # 多点位：不给顶层 summary，各点块用自己的结论（含各自 warning），逐点展示
+        return {'points': {k: one(v) for k, v in auto['points'].items()}}
+    return one(auto)
 
 def gen_crops(lon, lat, sub, atlas, all_zones=False):
     """生成单点裁剪图（8 幅统计图 + 默认 1 幅产流分区图），返回 [(key, title, path)]"""
@@ -164,12 +251,17 @@ def roman_disp(v):
     return ROMAN.get(v, v)
 
 
-def point_section(name, lon, lat, val, crops, summary=""):
+def point_section(name, lon, lat, val, crops, summary="", src="point"):
     val = val or {}
+    # 多点报告无全局结论时，回退用该点自己的 summary（from-auto 草稿把该点 warning 写进点内 summary）
+    summary = summary or val.get("summary", "")
     z = val.get("zones", {})
     z_main = z.get("产流", "")
     zones = [(k, z.get(k) or z_main) for k in ["产流", "瞬时", "推理"]]
     zone_names = [("产流计算分区", "产流参数"), ("瞬时单位线分区", "m₁ / K 参数"), ("推理公式计算分区", "汇流参数")]
+    src_row = ('<div class="tb-row"><span class="tb-k">点位来源</span>'
+               '<span class="tb-v">KML 面要素 · 取几何中心查值</span></div>') \
+        if src == "polygon-centroid" else ""
 
     # ---- 参数卡：每个历时一张，Pa / Cv 两栏 ----
     cards = []
@@ -250,7 +342,7 @@ def point_section(name, lon, lat, val, crops, summary=""):
   <section class="point-block">
     <div class="titleblock">
       <div class="tb-row"><span class="tb-k">查图点位</span><span class="tb-v strong">{name or '未命名'}</span></div>
-      <div class="tb-row"><span class="tb-k">经度 λ</span><span class="tb-v mono">{lon:.4f}° E</span></div>
+      {src_row}<div class="tb-row"><span class="tb-k">经度 λ</span><span class="tb-v mono">{lon:.4f}° E</span></div>
       <div class="tb-row"><span class="tb-k">纬度 φ</span><span class="tb-v mono">{lat:.4f}° N</span></div>
       <div class="tb-row"><span class="tb-k">投影配准</span><span class="tb-v mono">1162 px/°　误差 &lt; 2 km</span></div>
       <div class="tb-row"><span class="tb-k">读值口径</span><span class="tb-v">等值线标签内插，测站值不参与定值</span></div>
@@ -440,6 +532,7 @@ body{
   <footer class="colophon">
     <span>数据来源：《江西省暴雨洪水查算手册》附图 2-1~2-8、3-1、3-2、4-2</span>
     <span>图幅经纬网仿射配准（1162 px/度）· 定位误差 &lt; 2 km</span>
+    <span>__STAMP__</span>
   </footer>
 </div>
 </body></html>"""
@@ -448,14 +541,17 @@ HTML_TAIL = ""
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kml", default="", help="KML 文件路径（Point 型 Placemark，支持多点位）")
+    ap.add_argument("--kml", default="", help="KML 文件路径（Point / Polygon 型 Placemark，支持多点位）")
     ap.add_argument("--lon", type=float, help="经度 (114~118)")
     ap.add_argument("--lat", type=float, help="纬度 (25~30)")
     ap.add_argument("--name", default="", help="点名（单点模式可选）")
     ap.add_argument("--atlas", default=DEFAULT_ATLAS)
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--values", default="", help="第2步: 读值 JSON 字符串")
-    ap.add_argument("--values-file", dest="values_file", default="", help="第2步: 读值 JSON 文件（推荐）")
+    ap.add_argument("--values", default="", help="读值 JSON 字符串")
+    ap.add_argument("--values-file", dest="values_file", default="", help="读值 JSON 文件（人工定稿）")
+    ap.add_argument("--from-auto", dest="from_auto", default="",
+                    help="auto_value.py 输出的 JSON 文件：自动填值出报告草稿（Pa/建议值/依据/warning），"
+                         "并另存 values_auto_filled.json 供人工微调后用 --values-file 定稿")
     ap.add_argument("--all-zones", action="store_true", help="生成全部 3 张分区图裁剪（默认只生成产流分区，因三图分区号一致）")
     args = ap.parse_args()
 
@@ -465,24 +561,36 @@ def main():
             print(json.dumps({"error": "KML 文件不存在: " + args.kml}, ensure_ascii=False)); sys.exit(2)
         points = parse_kml(args.kml)
         if not points:
-            print(json.dumps({"error": "KML 中未找到有效的 Point 坐标"}, ensure_ascii=False)); sys.exit(2)
+            print(json.dumps({"error": "KML 中未找到有效点位（支持 Point 与 Polygon 外环质心）"}, ensure_ascii=False)); sys.exit(2)
     else:
         if args.lon is None or args.lat is None:
             print(json.dumps({"error": "需提供 --kml 或 --lon/--lat"}, ensure_ascii=False)); sys.exit(2)
-        points = [(args.name or "未命名", args.lon, args.lat)]
-    for n, lo, la in points:
-        if not (113.8 <= lo <= 118.2 and 24.8 <= la <= 30.2):
-            print(json.dumps({"error": "点位 {} ({},{}) 超出图幅范围(114~118E, 25~30N)".format(n, lo, la)}, ensure_ascii=False)); sys.exit(2)
+        points = [(args.name or "未命名", args.lon, args.lat, "point")]
+    for n, lo, la, _src in points:
+        err = out_of_bounds(lo, la)
+        if err:
+            print(json.dumps({"error": "点位 {} {}".format(n, err)}, ensure_ascii=False)); sys.exit(2)
 
     os.makedirs(args.out_dir, exist_ok=True)
     crop_dir = os.path.join(args.out_dir, "crops")
 
-    # 读值解析（第2步）
+    # 取值解析：--from-auto（机器草稿）或 --values/--values-file（人工定稿）
     multi = len(points) > 1
-    values_by_name = None
-    global_summary = ""
-    if args.values_file or args.values:
+    values_by_name, global_summary = None, ""
+    auto_draft = None
+    if args.from_auto:
+        auto = json.load(open(args.from_auto, encoding="utf-8-sig"))
+        auto_draft = values_from_auto(auto)
+        # 草稿另存，供人工微调后 --values-file 定稿（闭环）
+        _dp = os.path.join(args.out_dir, "values_auto_filled.json")
+        json.dump(auto_draft, open(_dp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    if auto_draft is not None:
+        v = auto_draft
+    elif args.values_file or args.values:
         v = json.load(open(args.values_file, encoding="utf-8-sig")) if args.values_file else json.loads(args.values)
+    else:
+        v = None
+    if v is not None:
         if "points" in v and isinstance(v["points"], dict):
             values_by_name = v["points"]
             global_summary = v.get("summary", "")
@@ -492,30 +600,34 @@ def main():
 
     # 生成裁剪图
     all_crops, manifest = [], []
-    for i, (n, lo, la) in enumerate(points, 1):
+    for i, (n, lo, la, src) in enumerate(points, 1):
         sub = os.path.join(crop_dir, "{:02d}_{}".format(i, safe(n))) if multi else crop_dir
         os.makedirs(sub, exist_ok=True)
         cr = gen_crops(lo, la, sub, args.atlas, all_zones=args.all_zones)
-        all_crops.append((n, lo, la, cr))
-        manifest.append({"name": n, "lon": lo, "lat": la, "dir": sub,
+        all_crops.append((n, lo, la, src, cr))
+        manifest.append({"name": n, "lon": lo, "lat": la, "src": src, "dir": sub,
                          "crops": [{"key": k, "title": t, "path": p} for k, t, p in cr]})
 
-    if not (args.values or args.values_file):
+    if v is None:
         print(json.dumps({"status": "crops-ready", "out_dir": args.out_dir, "points": manifest,
-                          "next": "逐幅读图后用 --values-file 生成正式报告"}, ensure_ascii=False))
+                          "next": "跑 auto_value.py 后用 --from-auto 出报告草稿；或逐幅读图后 --values-file 定稿"},
+                         ensure_ascii=False))
         return
 
-    # 第2步: 正式报告
+    # 正式报告
     tag = "_" + safe(points[0][0]) if len(points) == 1 else "_{}点".format(len(points))
     secs = ""
-    for n, lo, la, cr in all_crops:
+    for n, lo, la, src, cr in all_crops:
         val = values_by_name.get(n) if values_by_name else None
-        secs += point_section(n, lo, la, val, cr, global_summary)
-    html = HTML_HEAD.replace("__TAG__", tag).replace("__BODY__", secs) + HTML_TAIL
+        secs += point_section(n, lo, la, val, cr, global_summary, src=src)
+    html = (HTML_HEAD.replace("__TAG__", tag).replace("__BODY__", secs)
+            .replace("__STAMP__", _html.escape(data_stamp())) + HTML_TAIL)
     out_html = os.path.join(args.out_dir, "暴雨参数查值报告{}.html".format(tag))
     with open(out_html, "w", encoding="utf-8") as f:
         f.write(html)
-    print(json.dumps({"status": "report-done", "html": out_html}, ensure_ascii=False))
+    print(json.dumps({"status": "report-done", "html": out_html,
+                      "values_draft": os.path.join(args.out_dir, "values_auto_filled.json")
+                      if auto_draft is not None else ""}, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()

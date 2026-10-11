@@ -7,7 +7,10 @@ import cv2
 from skimage.morphology import skeletonize
 from PIL import Image, ImageDraw
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+for _p in (os.path.dirname(os.path.abspath(__file__)),
+           os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from parse_atlas import red_mask, DEFAULT_ATLAS
 from digitize_zones import (CX, CY, S9, KM, TITLE_Y, LEGEND_X, LEGEND_Y,
                             degree_map, province_roi, seg_median_rg, font)

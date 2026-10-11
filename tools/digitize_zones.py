@@ -32,7 +32,10 @@ import numpy as np
 import cv2
 from PIL import Image, ImageDraw
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+for _p in (os.path.dirname(os.path.abspath(__file__)),
+           os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from parse_atlas import red_mask, DEFAULT_ATLAS, DEFAULT_CACHE
 
 # ---------------- 配准常数（与 lookup.py 一致，勿随意改动） ----------------

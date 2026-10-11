@@ -1,105 +1,124 @@
 # -*- coding: utf-8 -*-
-"""一键查值：经纬度 → 8 个暴雨参数 + 产流分区（基于全量人工确认的数字化等值线线值库）。
+"""一键查值：经纬度/KML → 8 个暴雨参数 + 产流分区（几何缓存 + 人工确认线值库，秒级）。
 
 用法:
-  python auto_value.py --lon 115.51 --lat 28.99 [--out values.json]
+  python auto_value.py --lon 115.51 --lat 28.99 [--name 某水库] [--out values.json]
+  python auto_value.py --kml C:\\points.kml [--out values.json]        # 多点位
+输出 JSON:
+  单点位: {name, lon, lat, zone, zone_warning?, values: {1h-Pa: {...}}, has_warning}
+  多点位: {points: {点名: 同上}, has_warning}
+  每幅 values 项: nearest/opposite 的线号·值·实测距离km·地理方位角 + 距离加权内插值，
+  带 warning 字段的项须按 SKILL.md「读图纪律」人工复核。
 依赖:
-  cache/manual_labels_v2/<图幅>_lines.json   人工确认线值（349 条）
+  cache/geometry/<图幅>.npz                 线几何缓存（tools/build_geometry.py 生成，含图集 MD5 指纹自校验）
+  cache/manual_labels_v2/<图幅>_lines.json  人工确认线值（349 条）
   cache/manual_labels/<图幅>_extra_lines.json 人工补描线（可选）
   cache/zone_region_map.npz + region_zone_map.json  分区自动判定
-  atlas/ 或 DEFAULT_ATLAS                    图集原图（仅用于配准常数）
 说明:
-  内插=最近两条不同值等值线按距离加权；结果为机器初值，重要工程建议按
-  SKILL.md「读图纪律」人工复核夹持方向（同侧双线时程序无法判内外侧）。
+  内插=最近两条不同值等值线按距离加权，夹持对须分列点位两侧（方位差>90°）；
+  距离/方位角按纬度余弦各向异性换算（1°纬距111km、1°经距111·cosφ km），
+  修正了旧版东西向距离高估 11~13% 的系统偏差。
 """
-import argparse, json, math, os, sys, io
+import argparse, hashlib, json, math, os, sys, io
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-from digitize import build_lines
-from lookup import stat_xy
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+import numpy as np
+from registry import SKILL_ROOT, STAT_KEYS, STAT_FILE, resolve_atlas, stat_xy, km_scales, out_of_bounds
+from zone_lookup import zone_query
 
-SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE = os.path.join(SKILL, 'cache')
-ATLAS = os.path.join(SKILL, 'atlas')
-if not os.path.isdir(ATLAS):
-    ATLAS = r'D:\DSH工作区\自动查找图集参数\江西省暴雨洪水查算手册图集'
-SHEETS = ['1h-Pa', '1h-Cv', '6h-Pa', '6h-Cv', '24h-Pa', '24h-Cv', '3d-Pa', '3d-Cv']
-DUR = {'1h': '1h', '6h': '6h', '24h': '24h', '3d': '3d'}
+CACHE = os.path.join(SKILL_ROOT, 'cache')
+GEOM = os.path.join(CACHE, 'geometry')
 
-ap = argparse.ArgumentParser()
-ap.add_argument('--lon', type=float, required=True)
-ap.add_argument('--lat', type=float, required=True)
-ap.add_argument('--out', default='')
-a = ap.parse_args()
+_geom_cache = {}
+_md5_cache = {}
 
-# ---------- 分区 ----------
-zone = None
-zm = os.path.join(CACHE, 'zone_region_map.npz')
-mj = os.path.join(CACHE, 'region_zone_map.json')
-if os.path.isfile(zm) and os.path.isfile(mj):
-    import numpy as np
-    lab = np.load(zm)['labels']
-    H, W = lab.shape
-    x = int(3160.0 + (a.lon - 115.88) * 1170)
-    y = int(3390.0 + (28.68 - a.lat) * 1170)
-    rid = int(lab[min(max(y, 0), H - 1), min(max(x, 0), W - 1)])
-    for zn, info in json.load(open(mj, encoding='utf-8'))['ref2zone'].items():
-        if info['region_id'] == rid:
-            zone = zn
-            break
 
-# ---------- 各幅等值线 ----------
-out = {'lon': a.lon, 'lat': a.lat, 'zone': zone, 'values': {}}
-for key in SHEETS:
+def _md5(path):
+    st = os.stat(path)
+    key = (path, st.st_mtime_ns, st.st_size)
+    if key not in _md5_cache:
+        h = hashlib.md5()
+        with open(path, 'rb') as f:
+            for b in iter(lambda: f.read(1 << 20), b''):
+                h.update(b)
+        _md5_cache[key] = h.hexdigest()
+    return _md5_cache[key]
+
+
+def _die(msg):
+    print(json.dumps({'error': msg}, ensure_ascii=False))
+    sys.exit(2)
+
+
+def load_geometry(key):
+    """加载线几何缓存并核对图集指纹（不一致说明换过图，须重建几何）。"""
+    if key in _geom_cache:
+        return _geom_cache[key]
+    p = os.path.join(GEOM, key + '.npz')
+    if not os.path.isfile(p):
+        _die('几何缓存缺失: %s —— 请在开发目录运行 tools/build_geometry.py 生成后 '
+             '运行 deploy.ps1 同步（旧版每次查询重数字化 8 幅大图需 103 秒，已弃用）' % p)
+    z = np.load(p, allow_pickle=False)
+    meta = json.loads(str(z['meta'][0]))
+    src = os.path.join(resolve_atlas(), meta.get('file', STAT_FILE[key]))
+    if os.path.isfile(src) and _md5(src) != meta.get('atlas_md5'):
+        _die('图集文件 %s 与几何缓存指纹不一致（图集被更换/重扫过）——'
+             '请重跑 tools/build_geometry.py 并 deploy' % src)
+    _geom_cache[key] = (meta, list(map(str, z['ids'])), z['offsets'], z['flat'], z['closed'])
+    return _geom_cache[key]
+
+
+def _adiff(a, b):
+    d = abs(a - b) % 360
+    return min(d, 360 - d)
+
+
+def query_sheet(key, lon, lat):
+    """单幅查值：几何缓存 + 线值库 → 最近线/对侧线/内插值（含 warning 判定）。"""
     vp = os.path.join(CACHE, 'manual_labels_v2', key + '_lines.json')
     if not os.path.isfile(vp):
-        continue
-    sheet = json.load(open(os.path.join(os.path.dirname(vp), '..', 'digit_v2_sheet.json'), encoding='utf-8')).get(key) if False else None
-    import glob
-    from PIL import Image
-    # 图幅文件名由 SKILL 约定
-    FN = {'1h-Pa': '1--1h-Pa.jpg', '1h-Cv': '2--1h-Cv.jpg', '6h-Pa': '3--6h-Pa.jpg', '6h-Cv': '4--6h-Cv.jpg',
-          '24h-Pa': '5--24h-Pa.jpg', '24h-Cv': '6--24h-Cv.jpg', '3d-Pa': '7--3d-Pa.jpg', '3d-Cv': '8--3d-Cv.jpg'}[key]
-    im = Image.open(os.path.join(ATLAS, FN))
-    W, H = im.size
+        return None
     vals = json.load(open(vp, encoding='utf-8'))
-    lines = []
-    for lid, v in vals.items():
-        lines.append({'id': lid, 'value': v, 'samples': []})   # 占位，稍后用重数字化太慢
-    # 直接重建线采样（merge60 与线值库同源）
-    _, _, _, ls = build_lines(os.path.join(ATLAS, FN), merge_px=60)
-    byid = {c['id']: c for c in ls}
-    usable = []
-    for i in vals:
-        c = byid.get(i)
-        if c is not None:
-            c['value'] = vals[i]
-            usable.append(c)
-    for r in json.load(open(os.path.join(CACHE, 'manual_labels', key + '_extra_lines.json'),
-                            encoding='utf-8')) if os.path.isfile(os.path.join(CACHE, 'manual_labels', key + '_extra_lines.json')) else []:
-        usable.append({'id': r['id'], 'value': r['value'], 'closed': r.get('closed', False),
-                       'samples': [tuple(p) for p in r['polyline_px']]})
-    x, y = stat_xy(a.lon, a.lat, W, H)
-    KM = 111.0 / 1162.0
+    meta, ids, offsets, flat, closed = load_geometry(key)
+    x, y = stat_xy(lon, lat, meta['W'], meta['H'])
+    kx, ky = km_scales(lat)
+
+    # 主线集（挂上人工确认值的）+ 人工补描线，统一拼成一份采样点数组
+    segs = []                                   # (id, value, closed, i0, i1)
+    pts = [flat]
+    for i, lid in enumerate(ids):
+        v = vals.get(lid)
+        if v:
+            segs.append((lid, float(v), bool(closed[i]), int(offsets[i]), int(offsets[i + 1])))
+    ep = os.path.join(CACHE, 'manual_labels', key + '_extra_lines.json')
+    extra_base = len(flat)
+    if os.path.isfile(ep):
+        for r in json.load(open(ep, encoding='utf-8')):
+            arr = np.asarray(r['polyline_px'], dtype=np.int32)
+            segs.append((r['id'], float(r['value']), bool(r.get('closed')),
+                         extra_base, extra_base + len(arr)))
+            extra_base += len(arr)
+            pts.append(arr)
+    if not segs:
+        return None
+    allpts = np.concatenate(pts)
+
+    dxk = (allpts[:, 0] - x) * kx               # 东向 km
+    dyk = (y - allpts[:, 1]) * ky               # 北向 km（像面向下为南）
+    d2 = dxk * dxk + dyk * dyk
     rows = []
-    for c in usable:
-        if not c.get('value'):
-            continue
-        d, bx, by = min(((math.hypot(sx - x, sy - y), sx, sy) for sx, sy in c['samples']), key=lambda t: t[0])
-        ang = (math.degrees(math.atan2(bx - x, y - by)) + 360) % 360   # 地理方位角：正北 0°，顺时针
-        rows.append((d * KM, float(c['value']), ang, c['id'], bool(c.get('closed'))))
+    for lid, v, clo, i0, i1 in segs:
+        j = i0 + int(np.argmin(d2[i0:i1]))
+        rows.append((math.sqrt(d2[j]), v,
+                     (math.degrees(math.atan2(dxk[j], dyk[j])) + 360) % 360,   # 地理方位角：正北0°顺时针
+                     lid, clo))
     rows.sort()
-    if not rows:
-        continue
-    v0 = rows[0][1]
-    az0 = rows[0][2]
 
-    def _adiff(a, b):
-        d = abs(a - b) % 360
-        return min(d, 360 - d)
-
-    cands = [r for r in rows[1:] if r[1] != v0]      # 按距离排序的候选夹持线
-    # 夹持对必须分列点位两侧：优先取反方向（方位差 >90°）的最近不同值线
+    v0, az0 = rows[0][1], rows[0][2]
+    cands = [r for r in rows[1:] if r[1] != v0]
+    # 夹持对必须分列点位两侧：优先取反方向（方位差>90°）的最近不同值线
     other = next((r for r in cands if _adiff(r[2], az0) > 90), None)
     warn = ''
     if other is None:
@@ -112,13 +131,12 @@ for key in SHEETS:
                 '已改取反方向对侧线 %s %.1f km 夹持；请人工复核点位内外侧'
                 % (round(_adiff(cands[0][2], az0)), cands[0][3], cands[0][0],
                    rows[0][3], rows[0][0], other[3], other[0]))
-    ent = {'nearest': {'id': rows[0][3], 'value': v0, 'km': rows[0][0], 'azimuth': round(az0)}}
+    ent = {'nearest': {'id': rows[0][3], 'value': v0, 'km': round(rows[0][0], 3), 'azimuth': round(az0)}}
     if other:
         d0, d1 = rows[0][0], other[0]
         vi = round(v0 + (other[1] - v0) * (d0 / (d0 + d1)), 2)
-        ent['opposite'] = {'id': other[3], 'value': other[1], 'km': other[0], 'azimuth': round(other[2])}
+        ent['opposite'] = {'id': other[3], 'value': other[1], 'km': round(other[0], 3), 'azimuth': round(other[2])}
         ent['interpolated'] = vi
-        # 夹持线过远：内插不可靠，需提示（线稀疏区）
         if d0 > 30:
             far = '夹持线较远（最近 %.1f km / 对侧 %.1f km），位于等值线稀疏区，内插不确定度大，建议人工复核' % (d0, d1)
             warn = (warn + '；' if warn else '') + far
@@ -128,8 +146,71 @@ for key in SHEETS:
             warn = (warn + '；' if warn else '') + far
     if warn:
         ent['warning'] = warn
-    out['values'][key] = ent
+    return ent
 
-if a.out:
-    json.dump(out, open(a.out, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
-print(json.dumps(out, ensure_ascii=False, indent=1))
+
+def query_point(name, lon, lat):
+    """单点全量查值：8 幅等值线 + 产流分区。"""
+    err = out_of_bounds(lon, lat)
+    if err:
+        return {'name': name, 'lon': lon, 'lat': lat, 'error': err}
+    zq = zone_query(lon, lat)
+    values = {}
+    for key in STAT_KEYS:
+        ent = query_sheet(key, lon, lat)
+        if ent is not None:
+            values[key] = ent
+    ent = {'name': name, 'lon': lon, 'lat': lat, 'zone': zq.get('zone'),
+           'values': values}
+    for k in ('warning', 'error'):
+        if zq.get(k):
+            ent['zone_' + k] = zq[k]
+    ent['has_warning'] = (any('warning' in v for v in values.values())
+                          or bool(zq.get('warning')) or bool(zq.get('error')))
+    return ent
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--lon', type=float)
+    ap.add_argument('--lat', type=float)
+    ap.add_argument('--name', default='', help='点名（单点模式可选）')
+    ap.add_argument('--kml', default='', help='KML 文件（Point/Polygon 型 Placemark，多点位）')
+    ap.add_argument('--out', default='', help='结果 JSON 输出文件（可选）')
+    a = ap.parse_args()
+
+    if a.kml:
+        if not os.path.isfile(a.kml):
+            _die('KML 文件不存在: ' + a.kml)
+        from lookup import parse_kml
+        pts = parse_kml(a.kml)
+        if not pts:
+            _die('KML 中未找到有效点位（支持 Point 与 Polygon 外环质心）')
+    else:
+        if a.lon is None or a.lat is None:
+            _die('需提供 --lon/--lat 或 --kml')
+        pts = [(a.name or '未命名', a.lon, a.lat, 'point')]
+
+    results = [query_point(n, lo, la) for n, lo, la, _src in pts]
+    bad = [r for r in results if 'error' in r]
+    if len(results) == 1:
+        out = results[0]
+    else:
+        byname, seen = {}, {}
+        for r in results:                      # 同名点位去重命名，避免字典键冲突
+            base, k = r['name'], seen.get(r['name'], 0) + 1
+            seen[r['name']] = k
+            byname[base if k == 1 else '%s#%d' % (base, k)] = r
+        out = {'points': byname}
+    out['has_warning'] = any(r.get('has_warning') for r in results)
+    if bad and a.kml:
+        out['note'] = '有 %d 个点位未完成查值（见各点 error 字段）' % len(bad)
+
+    if a.out:
+        json.dump(out, open(a.out, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    sys.exit(2 if (not a.kml and bad) else 0)
+
+
+if __name__ == '__main__':
+    main()
